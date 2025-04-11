@@ -3,19 +3,22 @@ from datetime import date
 
 class ELO_System:
 	BASE_ELO = 1500
-	EXPECTED_SCORE_CONSTANT = 400 # lower constant -> steeper expected score gradient
-	SCALING_CONSTANT = 150
+	EXPECTED_SCORE_CONSTANT = 500 # lower constant -> steeper expected score gradient
+	SCALING_CONSTANT = 100
 
 	def __init__(self, records, save_filepath="scores.json"):
 		self.records = records
 		self.filepath = save_filepath
 
-	def init_player(self, player):
+	def _init_player(self, player):
 		self.records[player] = {
-			"scores":[],
+			"id":player,
+			"scores":[], # List of (date, event, score) tuples
 			"best":{},
 			"avg":{},
-			"elo":ELO_System.BASE_ELO
+			"elo":ELO_System.BASE_ELO,
+			"W":0,
+			"L":0
 		}
 
 	def from_json(filepath):
@@ -26,21 +29,21 @@ class ELO_System:
 		write_json_file(self.records, self.filepath)
 
 
-	def expectedScore(self, playerA):
+	def _expectedScore(self, playerA):
 		# return player's expected score -> avg?
 		pass
 
-	def update_elo_single_player(self, playerA, scoreA):
+	def _update_elo_single_player(self, playerA, scoreA):
 		pass
 
-	def expectedResult(self, playerA, playerB):
+	def _expectedResult(self, playerA, playerB):
 		# return normalized result for a 1 vs 1 
 		eloA = self.records[playerA]["elo"]
 		eloB = self.records[playerB]["elo"]
 		return 1 / (1 + 10 ** ((eloB - eloA) / ELO_System.EXPECTED_SCORE_CONSTANT))
 
-	def update_elo_two_players(self, playerA, scoreA, playerB, scoreB):
-		expected = self.expectedResult(playerA, playerB)
+	def _update_elo_two_players(self, playerA, scoreA, playerB, scoreB):
+		expected = self._expectedResult(playerA, playerB)
 		actual = int(scoreA) / (int(scoreA) + int(scoreB))
 		elo_delta = ELO_System.SCALING_CONSTANT * (actual - expected)
 
@@ -50,15 +53,11 @@ class ELO_System:
 		return self.records[playerA]["elo"], self.records[playerB]["elo"], elo_delta
 
 
-	def update_elo(self, playerA, scoreA, playerB=None, scoreB=None):
-		for p in [playerA, playerB]:
-			if p and not p in self.records:
-				self.init_player(p)
-		
+	def _update_elo(self, playerA, scoreA, playerB=None, scoreB=None):		
 		if not playerB:
-			return self.update_elo_single_player(playerA, scoreA)
+			return self._update_elo_single_player(playerA, scoreA)
 		else:
-			return self.update_elo_two_players(playerA, scoreA, playerB, scoreB)
+			return self._update_elo_two_players(playerA, scoreA, playerB, scoreB)
 
 
 	'''
@@ -75,7 +74,7 @@ class ELO_System:
 			player, score = s
 			today = date.today().isoformat()
 			if not player in records:
-				self.init_player(player)
+				self._init_player(player)
 			records[player]["scores"].append((today, event, int(score)))
 
 			# Update stats for the event
@@ -86,6 +85,22 @@ class ELO_System:
 		return (event, scores)
 
 
+	def challenge_match(self, playerA, scoreA, playerB, scoreB):
+		for p in [playerA, playerB]:
+			if p and not p in self.records:
+				self._init_player(p)
+
+		eloA, eloB, elo_delta = self._update_elo(playerA, scoreA, playerB, scoreB)
+		if scoreA > scoreB:
+			self.records[playerA]["W"]+=1
+			self.records[playerB]["L"]+=1
+		elif scoreB > scoreA:
+			self.records[playerB]["W"]+=1
+			self.records[playerA]["L"]+=1
+
+		return eloA, eloB, elo_delta
+
+
 	def get_leaderboard(self, event):
 		event = event.lower() if event else None
 		assert event == None or event in ["air", "sport", "standard"] 
@@ -93,15 +108,17 @@ class ELO_System:
 		records = self.records
 		
 		by_elo = sorted(records.keys(), key=lambda k: records[k]["elo"], reverse=True)
-		by_elo_list = "\n".join([f"{i+1}. {key} - {round(records[key]['elo'])}" for i, key in enumerate(by_elo)])
 
-		by_best = by_best_list = None
-		by_avg = by_avg_list = None
+		by_best  = None
+		by_avg = None
 		if event:
 			by_best = sorted(filter(lambda k: event in records[k]["best"], records.keys()), key=lambda k: records[k]["best"][event], reverse=True)
 			by_avg = sorted(filter(lambda k: event in records[k]["avg"], records.keys()), key=lambda k: records[k]["avg"][event], reverse=True)
 
-			by_best_list = "\n".join([f"{i+1}. {key} - {records[key]['best'][event]}" for i, key in enumerate(by_best)])
-			by_avg_list = "\n".join([f"{i+1}. {key} - {round(records[key]['avg'][event], 2)}" for i, key in enumerate(by_avg)])
+		return by_elo, by_best, by_avg
 
-		return by_elo_list, by_best_list, by_avg_list
+
+	def get_info(self, player):
+		if not player in self.records:
+			self._init_player(player)
+		return self.records[player]

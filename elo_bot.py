@@ -6,19 +6,21 @@ from flask import Flask, request, jsonify
 from slackeventsapi import SlackEventAdapter
 
 from elo_system import ELO_System
-from graphics import matrix_to_ascii_table
+from graphics import matrix_to_ascii_table, generate_bracket_image
 
 app = Flask(__name__)
 
 SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 VERIFICATION_TOKEN = os.environ["VERIFICATION_TOKEN"]
-ELO_BOT_CHANNEL_ID = "C08LY4U1H63" # #elo-bot channel ID
+ELO_BOT_CHANNEL_ID = os.environ["ELO_BOT_CHANNEL_ID"]
 slack_events_adapter = SlackEventAdapter(SLACK_SIGNING_SECRET, "/slack/events", app)
 
 elo_system = None
 
 SLACK_ID_REGEX = r"<(@[A-Z0-9]*)(?:\|[a-z0-9._-]*)?>"
+SLACK_ID_MATCH_USERNAME_REGEX = r"<(@[A-Z0-9]*)\|?([a-z0-9._-]*)?>"
+BRACKET_IMG_FILENAME = "bracket.png"
 
 @app.route('/leaderboard', methods=['POST'])
 def leaderboard():
@@ -90,11 +92,14 @@ def challenge_match():
 
     response_text = ""
     if result:
-        playerA, scoreA, playerB, scoreB, eloA, eloB, elo_delta = result
+        playerA, scoreA, playerB, scoreB, eloA, eloB, elo_delta, bracket_img_filename = result
         eloA = round(eloA, 2)
         eloB = round(eloB, 2)
         elo_delta = round(elo_delta, 2)
         response_text = f"*{playerA}: {eloA - elo_delta} -> {eloA}*\n*{playerB}: {eloB + elo_delta} -> {eloB}*"
+
+        if bracket_img_filename:
+            upload_image(bracket_img_filename)
     else:
         response_text = f"Invalid format, please write as: @User1 Score1 - Score2 @User2"
     
@@ -149,6 +154,22 @@ def get_player_info():
     return jsonify(response)
 
 
+@app.route('/tournament', methods=['POST'])
+def start_tournament():
+    data = request.form
+    if not data.get('token') == VERIFICATION_TOKEN:
+        return
+
+    text = data.get('text')
+    bracket_img_filename = handle_start_tournament(text)
+
+    if not bracket_img_filename:
+        return jsonify({"response_type": "in_channel", "text": "Internal error when starting tournament :("})
+
+    upload_image(bracket_img_filename)
+    return jsonify({"response_type": "in_channel"})
+
+
 @slack_events_adapter.on("app_mention")
 def app_mention(event_data):
     print(json.dumps(event_data, indent=2))
@@ -198,13 +219,20 @@ def handle_challenge_match(text):
         return None
 
     playerA = f"<{groups[0]}>"
-    scoreA = groups[1]
-    scoreB = groups[2]
+    scoreA = int(groups[1])
+    scoreB = int(groups[2])
     playerB = f"<{groups[3]}>"
 
-    eloA, eloB, elo_delta = elo_system.challenge_match(playerA, scoreA, playerB, scoreB)
+    eloA, eloB, elo_delta, found_tournament_match = elo_system.challenge_match(playerA, scoreA, playerB, scoreB)
     elo_system.save_to_json()
-    return playerA, scoreA, playerB, scoreB, eloA, eloB, elo_delta
+
+    bracket_img_filename = None
+    if found_tournament_match:
+        bracket = elo_system.get_tournament_bracket()
+        bracket_img_filename = BRACKET_IMG_FILENAME
+        generate_bracket_image(bracket, bracket_img_filename)
+
+    return playerA, scoreA, playerB, scoreB, eloA, eloB, elo_delta, bracket_img_filename
 
 
 def handle_get_player_info(text):
@@ -216,6 +244,24 @@ def handle_get_player_info(text):
     player = f"<{match.groups()[0]}>"
 
     return elo_system.get_info(player)
+
+
+def handle_start_tournament(text):
+    player_pattern = rf"{SLACK_ID_MATCH_USERNAME_REGEX}"
+
+    players = re.findall(player_pattern, text)
+    if not players:
+        return None
+    players = list(map(lambda x: (f"<{x[0]}>", x[1]), players))
+
+    elo_system.start_tournament(players)
+    elo_system.save_to_json()
+    bracket = elo_system.get_tournament_bracket()
+
+    bracket_img_filename = BRACKET_IMG_FILENAME
+    generate_bracket_image(bracket, bracket_img_filename)
+
+    return bracket_img_filename
 
 
 def send_message(msg, channel=ELO_BOT_CHANNEL_ID):
@@ -230,6 +276,33 @@ def send_message(msg, channel=ELO_BOT_CHANNEL_ID):
     }
     r = requests.post("https://slack.com/api/chat.postMessage", headers=headers, data=json.dumps(payload))
     print("Send Message POST Response:", r.text)
+
+
+def upload_image(filepath, channel=ELO_BOT_CHANNEL_ID):
+    response = requests.post(
+        "https://slack.com/api/files.getUploadURLExternal",
+        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+        data={"filename": filepath, "length": os.path.getsize(filepath)} 
+    )
+
+    upload_info = response.json()
+    upload_url = upload_info["upload_url"]
+    file_id = upload_info["file_id"]
+
+    with open(filepath, "rb") as file:
+        upload_response = requests.post(upload_url, files={"file": file})
+
+    complete_response = requests.post(
+        "https://slack.com/api/files.completeUploadExternal",
+        headers={
+            "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "files": [{"id": file_id}],
+            "channel_id": channel  # Replace with your channel ID
+        }
+    )
 
 
 def add_reaction(emoji_name, msg_timestamp, channel=ELO_BOT_CHANNEL_ID):
@@ -247,7 +320,7 @@ def add_reaction(emoji_name, msg_timestamp, channel=ELO_BOT_CHANNEL_ID):
 
 
 if __name__ == "__main__":
-    elo_system = ELO_System.from_json("scores.json")
+    elo_system = ELO_System.from_json("state.json")
     app.run(port=3000)
 
 '''
@@ -257,7 +330,6 @@ TODO:
 - more games with elo
 - season system with W-L ranking + tournament system/bracket
     - make leaderboard list by elo and display W-L?
-- fun messages for duel results
+- fun messages for duel results + tournament finishes
 - better UI / message response formatting
-- extract username from slash commands
 '''

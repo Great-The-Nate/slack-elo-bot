@@ -1,4 +1,5 @@
 secrets.sh
 __pycache__*
 slack_venv*
-scores.json
+state.json
+bracket.png
